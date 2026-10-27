@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Study Planner — Daily Reminders</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>" />
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<script src="https://unpkg.com/lucide@latest"></script>
+<script>
+  // Avoid theme flash before paint
+  document.documentElement.setAttribute('data-theme',
+    localStorage.getItem('sp-theme') ||
+    (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+</script>
+</head>
+
+<body class="min-h-screen bg-base-200">
+<div class="mx-auto max-w-2xl p-4 sm:p-6">
+
+  <!-- Header -->
+  <header class="mb-6 flex items-center justify-between gap-3">
+    <div class="flex items-center gap-3">
+      <div class="rounded-xl bg-primary p-2.5 text-primary-content shadow-sm">
+        <i data-lucide="graduation-cap" class="h-5 w-5"></i>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold leading-tight sm:text-2xl">Study Planner</h1>
+        <p id="todayLabel" class="text-xs opacity-60"></p>
+      </div>
+    </div>
+    <div class="flex gap-1">
+      <button id="bellBtn" class="btn btn-circle btn-ghost" title="Enable daily reminders">
+        <i data-lucide="bell" class="h-5 w-5"></i>
+      </button>
+      <button id="themeBtn" class="btn btn-circle btn-ghost" title="Toggle theme"></button>
+    </div>
+  </header>
+
+  <!-- Reminder banner -->
+  <div id="reminder" class="alert alert-warning mb-4 hidden">
+    <i data-lucide="bell-ring" class="h-5 w-5"></i>
+    <span id="reminderText" class="text-sm"></span>
+  </div>
+
+  <!-- Add task -->
+  <div class="card mb-4 bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <form id="form" class="flex flex-col gap-2 sm:flex-row">
+        <input id="subject" class="input w-full flex-1" placeholder="Subject (e.g. Math revision)" maxlength="60" required />
+        <input id="deadline" type="date" class="input" required />
+        <button class="btn btn-primary gap-1" type="submit">
+          <i data-lucide="plus" class="h-4 w-4"></i> Add
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Daily overview -->
+  <div class="card mb-6 bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <div class="grid grid-cols-3 gap-2 text-center">
+        <div class="rounded-box bg-base-200 p-3">
+          <div id="statTotal" class="text-2xl font-bold">0</div>
+          <div class="text-xs opacity-60">Today</div>
+        </div>
+        <div class="rounded-box bg-base-200 p-3">
+          <div id="statDone" class="text-2xl font-bold text-success">0</div>
+          <div class="text-xs opacity-60">Done</div>
+        </div>
+        <div class="rounded-box bg-base-200 p-3">
+          <div id="statPending" class="text-2xl font-bold text-warning">0</div>
+          <div class="text-xs opacity-60">Pending</div>
+        </div>
+      </div>
+      <div class="mt-3 flex items-center gap-2">
+        <progress id="progress" class="progress progress-success w-full" value="0" max="100"></progress>
+        <span id="progressLabel" class="text-xs opacity-60">0%</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task lists -->
+  <div id="lists">
+    <section class="mb-6">
+      <h2 class="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide opacity-70">
+        <i data-lucide="calendar-check" class="h-4 w-4"></i> Today
+      </h2>
+      <ul id="todayList" class="space-y-2"></ul>
+    </section>
+
+    <section>
+      <h2 class="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide opacity-70">
+        <i data-lucide="calendar-days" class="h-4 w-4"></i> Upcoming &amp; Overdue
+      </h2>
+      <ul id="otherList" class="space-y-2"></ul>
+    </section>
+  </div>
+
+</div>
+
+<script>
+/* ---------------- Helpers ---------------- */
+const $ = s => document.querySelector(s);
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+const fmtDate = iso => new Date(iso + 'T00:00:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+const esc = s => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* ---------------- IndexedDB ---------------- */
+let dbp;
+function db() {
+  if (!dbp) dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('study-planner', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('tasks', { keyPath: 'id', autoIncrement: true });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  return dbp;
+}
+async function tx(mode, fn) {
+  const d = await db();
+  return new Promise((res, rej) => {
+    const t = d.transaction('tasks', mode);
+    const req = fn(t.objectStore('tasks'));
+    t.oncomplete = () => res(req && req.result);
+    t.onerror = () => rej(t.error);
+  });
+}
+const getAll = () => tx('readonly', s => s.getAll());
+const addTask = t => tx('readwrite', s => s.add(t));
+const putTask = t => tx('readwrite', s => s.put(t));
+const delTask = id => tx('readwrite', s => s.delete(id));
+
+/* ---------------- State & rendering ---------------- */
+let tasks = [];
+
+const emptyHTML = msg =>
+  `<li class="rounded-box border border-dashed border-base-300 py-6 text-center text-sm opacity-50">${msg}</li>`;
+
+function taskHTML(t) {
+  const overdue = !t.done && t.deadline < todayStr();
+  return `
+  <li class="card bg-base-100 shadow-sm">
+    <div class="flex items-center gap-3 p-3">
+      <input type="checkbox" class="checkbox checkbox-primary checkbox-sm" data-id="${t.id}" ${t.done ? 'checked' : ''} aria-label="Toggle done" />
+      <div class="min-w-0 flex-1">
+        <p class="truncate font-medium ${t.done ? 'line-through opacity-50' : ''}">${esc(t.subject)}</p>
+        <p class="flex items-center gap-1 text-xs ${overdue ? 'text-error' : 'opacity-60'}">
+          <i data-lucide="clock" class="h-3 w-3"></i>${overdue ? 'Overdue · ' : ''}${fmtDate(t.deadline)}
+        </p>
+      </div>
+      <button class="btn btn-circle btn-ghost btn-xs text-error" data-del="${t.id}" aria-label="Delete">
+        <i data-lucide="trash-2" class="h-4 w-4"></i>
+      </button>
+    </div>
+  </li>`;
+}
+
+function render() {
+  const today = todayStr();
+  const todayTasks = tasks.filter(t => t.deadline === today)
+                          .sort((a, b) => (a.done - b.done) || a.subject.localeCompare(b.subject));
+  const otherTasks = tasks.filter(t => t.deadline !== today)
+                          .sort((a, b) => a.deadline.localeCompare(b.deadline) || (a.done - b.done));
+
+  // Overview
+  const done = todayTasks.filter(t => t.done).length;
+  const pending = todayTasks.length - done;
+  $('#statTotal').textContent = todayTasks.length;
+  $('#statDone').textContent = done;
+  $('#statPending').textContent = pending;
+  const pct = todayTasks.length ? Math.round(done / todayTasks.length * 100) : 0;
+  $('#progress').value = pct;
+  $('#progressLabel').textContent = pct + '%';
+
+  // Lists
+  $('#todayList').innerHTML = todayTasks.length
+    ? todayTasks.map(taskHTML).join('')
+    : emptyHTML('No tasks for today — enjoy! 🎉');
+  $('#otherList').innerHTML = otherTasks.length
+    ? otherTasks.map(taskHTML).join('')
+    : emptyHTML('Nothing scheduled yet.');
+
+  // Reminder banner
+  const overdue = tasks.filter(t => !t.done && t.deadline < today).length;
+  const parts = [];
+  if (pending) parts.push(`${pending} task${pending > 1 ? 's' : ''} due today`);
+  if (overdue) parts.push(`${overdue} overdue`);
+  if (parts.length) {
+    $('#reminderText').textContent = `Reminder: ${parts.join(' · ')}. Keep going!`;
+    $('#reminder').classList.remove('hidden');
+  } else {
+    $('#reminder').classList.add('hidden');
+  }
+
+  lucide.createIcons();
+}
+
+async function load() {
+  tasks = await getAll();
+  render();
+}
+
+/* ---------------- Theme ---------------- */
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  localStorage.setItem('sp-theme', t);
+  $('#themeBtn').innerHTML = `<i data-lucide="${t === 'dark' ? 'sun' : 'moon'}" class="h-5 w-5"></i>`;
+  lucide.createIcons();
+}
+
+/* ---------------- Notifications ---------------- */
+function notify(force) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const key = 'sp-notified-' + todayStr();
+  if (!force && localStorage.getItem(key)) return;
+  const n = tasks.filter(t => t.deadline === todayStr() && !t.done).length;
+  if (!n) return;
+  new Notification('📚 Study Planner', {
+    body: `${n} task${n > 1 ? 's' : ''} due today. Let's get to work!`
+  });
+  localStorage.setItem(key, '1');
+}
+
+/* ---------------- Events ---------------- */
+$('#form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const subject = $('#subject').value.trim();
+  const deadline = $('#deadline').value;
+  if (!subject || !deadline) return;
+  await addTask({ subject, deadline, done: false });
+  $('#subject').value = '';
+  $('#subject').focus();
+  await load();
+});
+
+$('#lists').addEventListener('change', async e => {
+  const box = e.target.closest('input[type="checkbox"][data-id]');
+  if (!box) return;
+  const task = tasks.find(t => t.id === Number(box.dataset.id));
+  if (!task) return;
+  task.done = box.checked;
+  await putTask(task);
+  await load();
+});
+
+$('#lists').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-del]');
+  if (!btn) return;
+  await delTask(Number(btn.dataset.del));
+  await load();
+});
+
+$('#themeBtn').addEventListener('click', () => {
+  applyTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+
+$('#bellBtn').addEventListener('click', async () => {
+  if (!('Notification' in window)) return alert('Notifications are not supported in this browser.');
+  const p = await Notification.requestPermission();
+  if (p === 'granted') notify(true);
+  else alert('Reminders blocked. Enable notifications in your browser settings.');
+});
+
+/* ---------------- Init ---------------- */
+(async function init() {
+  $('#todayLabel').textContent = new Date().toLocaleDateString(undefined, {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'
+  });
+  $('#deadline').value = todayStr();
+  applyTheme(document.documentElement.getAttribute('data-theme') || 'light');
+  await load();
+  notify(false);
+})();
+</script>
+</body>
+</html>
